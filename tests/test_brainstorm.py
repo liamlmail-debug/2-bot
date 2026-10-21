@@ -3,11 +3,13 @@
 執行：python3 -m unittest discover -s tests -v
 """
 
+import http.server
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -28,8 +30,11 @@ class Base(unittest.TestCase):
         self.log = root / "calls.jsonl"
         self.home = root / "home"
         self.home.mkdir()
-        dropped = {"SSH_CONNECTION", "SSH_CLIENT", "DBUS_SESSION_BUS_ADDRESS", "CLOUD_SHELL"}
-        env = {k: v for k, v in os.environ.items() if k not in dropped and not k.startswith("FAKE_")}
+        dropped = {"SSH_CONNECTION", "SSH_CLIENT", "DBUS_SESSION_BUS_ADDRESS", "CLOUD_SHELL", "GEMINI_API_KEY"}
+        env = {
+            k: v for k, v in os.environ.items()
+            if k not in dropped and not k.startswith(("FAKE_", "TWOBOT_"))
+        }
         env.update(
             PATH=f"{FAKE_BIN}{os.pathsep}{os.environ['PATH']}",
             HOME=str(self.home),
@@ -251,6 +256,173 @@ class PromptSize(Base):
         prompt = brainstorm.fit_prompt("開首", s, "任務")
         self.assertNotIn("節錄", prompt)
         self.assertIn("想法甲", prompt)
+
+
+QUOTA_ZERO = (429, {"error": {
+    "code": 429, "status": "RESOURCE_EXHAUSTED",
+    "message": "Quota exceeded for metric: generate_content_free_tier_requests, limit: 0, model: x",
+}})
+
+
+class FakeGemini:
+    """模擬 Gemini API 的本機伺服器：預設一律成功回覆，亦可為個別型號預設錯誤。"""
+
+    def __init__(self):
+        self.requests = []  # (方法, 路徑, API key, 內容)
+        self.models = [
+            "gemini-3.8-flash", "gemini-3.1-pro", "gemini-3.8-flash-lite",
+            "gemini-3.8-flash-image", "text-embedding-004",
+        ]
+        self.queued = {}  # 型號 -> [(狀態碼, 內容), ...]，按次序使用
+        fake = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _send(self, status, payload):
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                fake.requests.append(("GET", self.path, self.headers.get("x-goog-api-key"), None))
+                listed = [{"name": f"models/{m}", "supportedGenerationMethods": ["generateContent"]} for m in fake.models]
+                self._send(200, {"models": listed})
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+                fake.requests.append(("POST", self.path, self.headers.get("x-goog-api-key"), body))
+                model = self.path.split("/models/", 1)[1].split(":", 1)[0]
+                if fake.queued.get(model):
+                    return self._send(*fake.queued[model].pop(0))
+                text = body["contents"][0]["parts"][0]["text"]
+                task = text.split("【你現在的任務】", 1)[-1].strip().splitlines()[0]
+                parts = [{"text": "內部推理", "thought": True}, {"text": f"Gemini API 假回覆（{model}）：{task[:30]}"}]
+                self._send(200, {"candidates": [{"content": {"parts": parts}, "finishReason": "STOP"}]})
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}/v1beta"
+
+    def posts(self):
+        return [r for r in self.requests if r[0] == "POST"]
+
+    def posted_models(self):
+        return [r[1].split("/models/", 1)[1].split(":", 1)[0] for r in self.posts()]
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class ApiBackend(Base):
+    def setUp(self):
+        super().setUp()
+        self.fake = FakeGemini()
+        self.addCleanup(self.fake.close)
+        only = Path(self.tmp.name) / "only-claude"
+        only.mkdir()
+        (only / "claude").symlink_to(FAKE_BIN / "claude")
+        self.env.update(
+            PATH=f"{only}{os.pathsep}{os.environ['PATH']}",
+            TWOBOT_GEMINI_API_BASE=self.fake.base,
+            GEMINI_API_KEY="test-key",
+        )
+
+    def test_auto_uses_api_and_skips_models_outside_free_tier(self):
+        self.fake.queued["gemini-3.8-flash"] = [QUOTA_ZERO]
+        r = self.run_bot("題目", "-r", "1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("Gemini 連接方式：API key", r.stdout)
+        self.assertEqual(self.fake.posted_models(), ["gemini-3.8-flash", "gemini-3.1-pro"])
+        method, path, key, body = self.fake.posts()[-1]
+        self.assertEqual(key, "test-key")
+        self.assertNotIn("test-key", path)
+        self.assertIn("你是「挑戰者」", body["systemInstruction"]["parts"][0]["text"])
+        self.assertIn("【題目】\n題目", body["contents"][0]["parts"][0]["text"])
+        self.assertIn("── 第 1 輪・Claude（發想者） ──", body["contents"][0]["parts"][0]["text"])
+        text = self.transcript()
+        self.assertIn("Gemini API 假回覆（gemini-3.1-pro）", text)
+        self.assertNotIn("內部推理", text)
+        self.assertIn("| Gemini 型號 | gemini-3.1-pro（API） |", text)
+        self.assertEqual((self.home / ".2bot" / "gemini_api_model").read_text().strip(), "gemini-3.1-pro")
+
+    def test_remembered_model_is_tried_first(self):
+        (self.home / ".2bot").mkdir()
+        (self.home / ".2bot" / "gemini_api_model").write_text("gemini-3.1-pro\n")
+        r = self.run_bot("題目", "-r", "2")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.fake.posted_models(), ["gemini-3.1-pro", "gemini-3.1-pro"])
+
+    def test_rate_limit_waits_then_retries_same_model(self):
+        busy = (429, {"error": {"code": 429, "message": "Resource exhausted. Please retry.", "details": [
+            {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "0s"}]}})
+        self.fake.queued["gemini-3.8-flash"] = [busy]
+        r = self.run_bot("題目", "-r", "1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.fake.posted_models(), ["gemini-3.8-flash", "gemini-3.8-flash"])
+
+    def test_invalid_key_stops_without_retrying(self):
+        bad = (400, {"error": {"code": 400, "status": "INVALID_ARGUMENT", "message": "API key not valid. Please pass a valid API key."}})
+        self.fake.queued["gemini-3.8-flash"] = [bad]
+        r = self.run_bot("題目", "-r", "1")
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(len(self.fake.posts()), 1)
+        self.assertIn("API key not valid", r.stderr)
+        self.assertIn("Gemini API key 是否正確", r.stderr)
+
+    def test_pinned_model_never_falls_back(self):
+        self.fake.queued["gemini-3.1-pro"] = [QUOTA_ZERO, QUOTA_ZERO]
+        r = self.run_bot("題目", "-r", "1", "--gemini-model", "gemini-3.1-pro")
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(self.fake.posted_models(), ["gemini-3.1-pro", "gemini-3.1-pro"])
+        self.assertFalse([req for req in self.fake.requests if req[0] == "GET"])
+
+    def test_unreachable_api_points_to_network_setting(self):
+        r = self.run_bot("題目", "-r", "1", TWOBOT_GEMINI_API_BASE="http://127.0.0.1:9/v1beta")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("未能連接 Gemini API", r.stderr)
+        self.assertIn("generativelanguage.googleapis.com", r.stderr)
+
+    def test_key_file_is_used_when_no_environment_variable(self):
+        (self.home / ".2bot").mkdir()
+        (self.home / ".2bot" / "gemini_api_key").write_text("file-key\n")
+        r = self.run_bot("題目", "-r", "1", GEMINI_API_KEY="")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.fake.posts()[0][2], "file-key")
+
+    def test_api_without_key_explains_how_to_add_one(self):
+        r = self.run_bot("題目", "--gemini-via", "api", GEMINI_API_KEY="")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("未有 Gemini API key", r.stderr)
+        self.assertEqual(self.fake.requests, [])
+
+    def test_explicit_agy_without_agy_installed_suggests_api_key(self):
+        r = self.run_bot("題目", "--gemini-via", "agy")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("找不到指令：agy", r.stderr)
+        self.assertIn("GEMINI_API_KEY", r.stderr)
+
+    def test_auto_prefers_agy_when_installed(self):
+        r = self.run_bot("題目", "-r", "1", PATH=f"{FAKE_BIN}{os.pathsep}{os.environ['PATH']}")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.fake.requests, [])
+        self.assertIn("agy", self.sequence())
+
+    def test_rank_models(self):
+        names = [
+            "gemini-3.8-flash", "gemini-3.1-pro", "gemini-4-argon", "gemini-3.8-flash-lite",
+            "gemini-3-pro-preview", "gemini-3.8-flash-image", "gemini-2.5-pro",
+            "text-embedding-004", "gemma-3-27b-it",
+        ]
+        self.assertEqual(
+            brainstorm.rank_models(names),
+            ["gemini-4-argon", "gemini-3.8-flash", "gemini-3.1-pro", "gemini-3-pro-preview", "gemini-2.5-pro"],
+        )
 
 
 class Setup(Base):

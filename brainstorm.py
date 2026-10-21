@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """2-bot：讓 Claude 與 Gemini 輪流腦力激盪。
 
-Claude 經 Claude Code（claude -p）使用你的 Claude 訂閱；
-Gemini 經 Antigravity CLI（agy -p）使用你的 Google AI 訂閱。
-兩者均無需 API 金鑰。用法見 README.md，或執行：python3 brainstorm.py --help
+Claude 經 Claude Code（claude -p）使用你的 Claude 訂閱。
+Gemini 有兩種連接方式：
+  - agy：經 Antigravity CLI（agy -p）使用你的 Google AI 訂閱；
+  - api：以 Gemini API key 直接連接（適用於不能安裝 agy 的環境）。
+用法見 README.md，或執行：python3 brainstorm.py --help
 """
 
 from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import os
 import re
 import shutil
@@ -17,6 +20,9 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -33,6 +39,20 @@ CALL_TIMEOUT = int(os.environ.get("TWOBOT_TIMEOUT", "900"))  # 每次發言最�
 RETRY_DELAY = float(os.environ.get("TWOBOT_RETRY_DELAY", "8"))  # 失敗後重試前的等候秒數
 # agy 以命令列參數接收內容，而 Linux 單一參數上限約 128 KB，故預留空間
 MAX_AGY_PROMPT_BYTES = 100_000
+
+# 以 API key 連接 Gemini 時使用
+GEMINI_API_BASE = os.environ.get(
+    "TWOBOT_GEMINI_API_BASE", "https://generativelanguage.googleapis.com/v1beta"
+).rstrip("/")
+STATE_DIR = Path(os.environ.get("TWOBOT_STATE_DIR") or Path.home() / ".2bot")
+KEY_FILE = STATE_DIR / "gemini_api_key"  # 存放 API key 的檔案（只保存在本機）
+MODEL_CACHE = STATE_DIR / "gemini_api_model"  # 上次成功使用的型號
+FALLBACK_MODEL = "gemini-3.8-flash"
+SKIP_MODEL_WORDS = (
+    "lite", "image", "tts", "audio", "live", "embed", "vision", "robotics",
+    "computer", "exp", "learnlm", "nano", "veo", "imagen", "aqa", "thinking",
+)
+MODEL_RE = re.compile(r"^gemini-(\d+(?:\.\d+)?)-([a-z][a-z0-9.-]*)$")
 
 CLAUDE, GEMINI, USER = "Claude", "Gemini", "使用者"
 LABEL = {CLAUDE: "Claude（發想者）", GEMINI: "Gemini（挑戰者）", USER: "使用者補充"}
@@ -80,6 +100,10 @@ HINT = {
         "可執行 agy models 查看可用型號。如已達用量上限，請稍後再試。"
     ),
 }
+HINT_API = (
+    "請檢查：Gemini API key 是否正確；如提示超出額度（429），請稍後再試，或以 --gemini-model 指定其他型號；"
+    "如未能連線，請確認網絡容許連接 generativelanguage.googleapis.com。"
+)
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 RULE_LINE = "-" * 32
@@ -99,6 +123,7 @@ class Session:
     claude_model: str | None
     gemini_model: str | None
     summary_by: str
+    gemini_api: GeminiAPI | None = None  # 以 API key 連接時使用；否則經 agy
     turns: list[dict] = field(default_factory=list)
     summary: str | None = None
 
@@ -251,12 +276,164 @@ def call_gemini(prompt: str, model: str | None) -> str:
     return run_cli(cmd, stdin_text=None, env=agy_env(), who=GEMINI)
 
 
+# ---------------------------------------------------------------- 以 API key 連接 Gemini
+
+
+class ApiError(CallError):
+    def __init__(self, status: int, message: str, retry_after: float | None = None):
+        # 400／401 多數是 API key 或請求本身有問題，重試亦無補於事
+        fatal = status in (400, 401) and "model" not in message.lower()
+        super().__init__(f"Gemini API 錯誤 {status}：{message}", retryable=not fatal)
+        self.status = status
+        self.api_message = message
+        self.retry_after = retry_after
+
+    @property
+    def quota_zero(self) -> bool:
+        """免費額度不包括此型號（limit: 0），等待亦無用，應改用其他型號。"""
+        return "limit: 0" in self.api_message
+
+
+def gemini_api_key() -> str | None:
+    key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if key:
+        return key
+    try:
+        words = KEY_FILE.read_text(encoding="utf-8").split()
+    except OSError:
+        return None
+    return words[0] if words else None
+
+
+def rank_models(names: list[str]) -> list[str]:
+    """由新至舊排列適合對話的 Gemini 型號；同一版本以 pro 優先，preview 版殿後。"""
+    scored = []
+    for name in names:
+        m = MODEL_RE.match(name)
+        if not m or any(word in name for word in SKIP_MODEL_WORDS):
+            continue
+        variant = m.group(2)
+        tier = 2 if variant.startswith("pro") else (0 if variant.startswith("flash") else 1)
+        stable = 0 if "preview" in variant else 1
+        scored.append(((float(m.group(1)), tier, stable), name))
+    return [name for _, name in sorted(scored, reverse=True)]
+
+
+def extract_text(data: dict) -> str:
+    candidates = data.get("candidates") or []
+    if not candidates:
+        reason = (data.get("promptFeedback") or {}).get("blockReason")
+        raise CallError(f"Gemini 未有回覆（{reason or '原因不明'}）。")
+    parts = (candidates[0].get("content") or {}).get("parts") or []
+    text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
+    if not text.strip():
+        raise CallError(f"Gemini 回覆為空（finishReason：{candidates[0].get('finishReason')}）。")
+    return text.strip()
+
+
+class GeminiAPI:
+    """以 API key 呼叫 Gemini API（generateContent）。
+
+    未指定型號時，會由最新的型號開始嘗試；如免費額度不包括該型號，便自動改用下一個，
+    並記下成功的型號供下次使用。
+    """
+
+    def __init__(self, key: str, model: str | None = None):
+        self.key = key
+        self.pinned = model
+        self.model = model
+
+    def _request(self, method: str, path: str, payload: dict | None = None) -> dict:
+        req = urllib.request.Request(
+            f"{GEMINI_API_BASE}/{path}",
+            data=None if payload is None else json.dumps(payload).encode("utf-8"),
+            method=method,
+            headers={"x-goog-api-key": self.key, "Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=CALL_TIMEOUT) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as err:
+            raw = err.read().decode("utf-8", "replace")
+            message, retry_after = raw.strip()[:500] or str(err.reason), None
+            try:
+                info = json.loads(raw).get("error", {})
+                message = info.get("message") or message
+                for detail in info.get("details", []):
+                    delay = str(detail.get("retryDelay", ""))
+                    if delay.endswith("s"):
+                        retry_after = float(delay[:-1] or 0)
+            except (ValueError, AttributeError):
+                pass
+            raise ApiError(err.code, message, retry_after) from None
+        except OSError as err:  # 包括連線被拒、逾時
+            reason = getattr(err, "reason", err)
+            raise CallError(f"未能連接 Gemini API：{reason}") from None
+
+    def candidates(self) -> list[str]:
+        if self.pinned:
+            return [self.pinned]
+        names: list[str] = []
+        token = ""
+        for _ in range(10):
+            query = "models?pageSize=1000" + (f"&pageToken={urllib.parse.quote(token)}" if token else "")
+            data = self._request("GET", query)
+            for item in data.get("models", []):
+                if "generateContent" in item.get("supportedGenerationMethods", []):
+                    names.append(item.get("name", "").split("/", 1)[-1])
+            token = data.get("nextPageToken") or ""
+            if not token:
+                break
+        ranked = rank_models(names) or [FALLBACK_MODEL]
+        try:
+            cached = MODEL_CACHE.read_text(encoding="utf-8").strip()
+        except OSError:
+            cached = ""
+        if cached in ranked:
+            ranked.remove(cached)
+            ranked.insert(0, cached)
+        return ranked
+
+    def generate(self, system: str, body: str) -> str:
+        payload = {
+            "systemInstruction": {"parts": [{"text": system}]},
+            "contents": [{"role": "user", "parts": [{"text": body}]}],
+        }
+        order = [self.model] if self.model else self.candidates()
+        last: ApiError | None = None
+        for model in order:
+            for attempt in range(3):
+                try:
+                    text = extract_text(self._request("POST", f"models/{model}:generateContent", payload))
+                except ApiError as err:
+                    last = err
+                    if err.status == 429 and not err.quota_zero and attempt < 2:
+                        wait = err.retry_after if err.retry_after is not None else 15
+                        time.sleep(min(wait, 60))  # 每分鐘次數限制：稍等再試
+                        continue
+                    if not err.retryable or self.pinned:
+                        raise
+                    break  # 此型號不可用，改試下一個
+                if self.model != model:
+                    self.model = model
+                    try:
+                        STATE_DIR.mkdir(parents=True, exist_ok=True)
+                        MODEL_CACHE.write_text(model + "\n", encoding="utf-8")
+                    except OSError:
+                        pass
+                return text
+        assert last is not None
+        raise last
+
+
 def speak(s: Session, who: str, task: str, *, summary: bool = False) -> str:
     role = SUMMARIZER if summary else ROLE[who]
     words = max(s.words * 2, 900) if summary else s.words
     header = role + "\n\n" + RULES.format(lang=s.lang, words=words)
     if who == CLAUDE:
         return call_claude(header, build_body(s.topic, s.context, s.turns, task), s.claude_model)
+    if s.gemini_api is not None:
+        return s.gemini_api.generate(header, build_body(s.topic, s.context, s.turns, task))
     return call_gemini(fit_prompt(header, s, task), s.gemini_model)
 
 
@@ -342,6 +519,10 @@ def slugify(text: str, limit: int = 24) -> str:
 
 
 def render_markdown(s: Session, started: dt.datetime, status: str | None) -> str:
+    if s.gemini_api is not None:
+        gemini_model = f"{s.gemini_api.model or '自動選擇'}（API）"
+    else:
+        gemini_model = s.gemini_model or "預設"
     lines = [
         f"# 腦力激盪：{s.topic}",
         "",
@@ -351,7 +532,7 @@ def render_markdown(s: Session, started: dt.datetime, status: str | None) -> str
         "| 參與者 | Claude（發想者）、Gemini（挑戰者） |",
         f"| 輪數 | {s.rounds} |",
         f"| Claude 型號 | {s.claude_model or '預設'} |",
-        f"| Gemini 型號 | {s.gemini_model or '預設'} |",
+        f"| Gemini 型號 | {gemini_model} |",
         f"| 總結撰寫 | {CLAUDE if s.summary_by == 'claude' else GEMINI} |",
     ]
     if status:
@@ -389,7 +570,14 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--lang", default="繁體中文（書面語）", help="回覆語言（預設：繁體中文（書面語））")
     p.add_argument("--summary-by", choices=["claude", "gemini"], default="claude", help="由誰撰寫最終總結（預設 claude）")
     p.add_argument("--claude-model", help="Claude 型號，例如 opus、sonnet（預設跟隨你的訂閱）")
-    p.add_argument("--gemini-model", help="Gemini 型號（可執行 agy models 查看；預設跟隨 agy 的 /model 設定）")
+    p.add_argument("--gemini-model", help="Gemini 型號（經 agy 時可執行 agy models 查看；經 API 時預設自動選擇）")
+    p.add_argument(
+        "--gemini-via",
+        choices=["auto", "agy", "api"],
+        default="auto",
+        help="Gemini 的連接方式：agy（經 Antigravity CLI 使用訂閱）或 api（使用 API key）；"
+        "預設 auto：有 agy 就用 agy，否則用 API key",
+    )
     args = p.parse_args(argv)
     if not 1 <= args.rounds <= 6:
         p.error("輪數須介乎 1 至 6")
@@ -413,9 +601,19 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parse_args(argv)
 
-    missing = [name for name in ("claude", "agy") if not shutil.which(name)]
+    key = gemini_api_key()
+    via = args.gemini_via
+    if via == "auto":
+        via = "api" if key and not shutil.which("agy") else "agy"
+    missing = [name for name in ("claude", "agy") if not shutil.which(name) and (name == "claude" or via == "agy")]
     if missing:
-        print(f"找不到指令：{'、'.join(missing)}。請先執行：bash {REPO_DIR / 'setup.sh'}", file=sys.stderr)
+        message = f"找不到指令：{'、'.join(missing)}。請先執行：bash {REPO_DIR / 'setup.sh'}"
+        if "agy" in missing:
+            message += f"\n（或改用 Gemini API key：設定 GEMINI_API_KEY，或把 key 存於 {KEY_FILE}）"
+        print(message, file=sys.stderr)
+        return 1
+    if via == "api" and not key:
+        print(f"未有 Gemini API key。請設定 GEMINI_API_KEY，或把 key 存於 {KEY_FILE}", file=sys.stderr)
         return 1
 
     topic = (args.topic or "").strip()
@@ -438,6 +636,7 @@ def main(argv: list[str] | None = None) -> int:
         claude_model=args.claude_model,
         gemini_model=args.gemini_model,
         summary_by=args.summary_by,
+        gemini_api=GeminiAPI(key, args.gemini_model) if via == "api" and key else None,
     )
     WORK_DIR.mkdir(parents=True, exist_ok=True)
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -455,6 +654,7 @@ def main(argv: list[str] | None = None) -> int:
     if context:
         print(f"背景：{context}")
     print(f"輪數：{s.rounds}（Claude {n_claude} 次、Gemini {n_gemini} 次）")
+    print(f"Gemini 連接方式：{'API key' if s.gemini_api else 'Antigravity CLI（訂閱）'}")
     print(RULE_LINE, flush=True)
     save("進行中")
 
@@ -481,8 +681,9 @@ def main(argv: list[str] | None = None) -> int:
         return 130
     except CallError as err:
         who = GEMINI if stage.endswith(GEMINI) else CLAUDE
+        hint = HINT_API if who == GEMINI and s.gemini_api else HINT[who]
         save(f"未完成：「{stage}」回覆失敗")
-        print(f"\n{err}\n\n{HINT[who]}\n已完成的部分已儲存：{path}", file=sys.stderr)
+        print(f"\n{err}\n\n{hint}\n已完成的部分已儲存：{path}", file=sys.stderr)
         return 1
 
     print(f"\n{'=' * 12} 最終總結 {'=' * 12}")
