@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+"""測試用的假 claude 指令：記錄收到的參數及內容，並回覆固定文字，不會連線。
+
+環境變數：
+  FAKE_LOG               每次呼叫寫入一行 JSON 紀錄
+  FAKE_STATE_DIR         存放呼叫次數
+  FAKE_CLAUDE_FAIL=N     首 N 次 -p 呼叫失敗
+  FAKE_CLAUDE_LOGGED_IN  "0" 表示未登入
+"""
+import json
+import os
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+
+if args[:1] == ["--version"]:
+    print("9.9.9 (Claude Code)")
+    sys.exit(0)
+if args[:2] == ["auth", "status"]:
+    print(json.dumps({"loggedIn": os.environ.get("FAKE_CLAUDE_LOGGED_IN", "1") == "1"}))
+    sys.exit(0)
+if args[:2] == ["auth", "login"]:
+    sys.exit(0)
+if "-p" not in args:
+    print("fake claude: 只支援 -p", file=sys.stderr)
+    sys.exit(2)
+
+stdin = sys.stdin.read()
+log = os.environ.get("FAKE_LOG")
+if log:
+    with open(log, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"bin": "claude", "args": args, "stdin": stdin}, ensure_ascii=False) + "\n")
+
+counter = Path(os.environ.get("FAKE_STATE_DIR", ".")) / "claude_calls"
+n = int(counter.read_text()) + 1 if counter.exists() else 1
+counter.write_text(str(n))
+if n <= int(os.environ.get("FAKE_CLAUDE_FAIL", "0")):
+    print("Not logged in · Please run /login")
+    sys.exit(1)
+
+task = stdin.split("【你現在的任務】", 1)[-1].strip().splitlines()[0] if "【你現在的任務】" in stdin else stdin.strip()
+print(f"\x1b[1mClaude 假回覆\x1b[0m：{task[:40]}")

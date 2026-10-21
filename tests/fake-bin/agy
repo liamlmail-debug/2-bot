@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""測試用的假 agy 指令：記錄收到的參數及內容，並回覆固定文字，不會連線。
+
+環境變數：
+  FAKE_LOG             每次呼叫寫入一行 JSON 紀錄
+  FAKE_STATE_DIR       存放呼叫次數
+  FAKE_AGY_FAIL=N      首 N 次 -p 呼叫失敗
+  FAKE_AGY_HUGE=1      回覆一段超長文字（約 120 KB）
+"""
+import json
+import os
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+
+if args[:1] == ["--version"]:
+    print("1.0.0")
+    sys.exit(0)
+if not args or args[0] not in ("-p", "--print", "--prompt") or len(args) < 2:
+    print("fake agy: 只支援 -p <內容>", file=sys.stderr)
+    sys.exit(2)
+
+prompt, extra = args[1], args[2:]
+log = os.environ.get("FAKE_LOG")
+if log:
+    entry = {
+        "bin": "agy",
+        "args": extra,
+        "prompt": prompt,
+        "prompt_bytes": len(prompt.encode("utf-8")),
+        "ssh_connection": os.environ.get("SSH_CONNECTION"),
+        "stdin_is_tty": sys.stdin.isatty(),
+    }
+    with open(log, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+if "--model" in extra and extra[extra.index("--model") + 1] == "bad-model":
+    print("Error: unknown model bad-model", file=sys.stderr)
+    sys.exit(1)
+
+counter = Path(os.environ.get("FAKE_STATE_DIR", ".")) / "agy_calls"
+n = int(counter.read_text()) + 1 if counter.exists() else 1
+counter.write_text(str(n))
+if n <= int(os.environ.get("FAKE_AGY_FAIL", "0")):
+    print("Error: authentication required", file=sys.stderr)
+    sys.exit(1)
+
+if os.environ.get("FAKE_AGY_HUGE") == "1":
+    print("長" * 40000)
+else:
+    task = prompt.split("【你現在的任務】", 1)[-1].strip().splitlines()[0] if "【你現在的任務】" in prompt else prompt
+    print(f"Gemini 假回覆：{task[:40]}")

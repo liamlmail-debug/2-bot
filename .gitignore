@@ -1,0 +1,4 @@
+# 討論紀錄只保存在本機，切勿上載（本 repository 為公開）
+sessions/
+__pycache__/
+*.pyc
