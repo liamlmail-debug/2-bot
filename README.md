@@ -67,20 +67,19 @@ brainstorm "香港上班族週末可經營的網上小生意" -c "啟動資金�
 
 輸入 `brainstorm --help` 可查看全部選項。
 
-## 在 Claude 對話中使用（毋須 Cloud Shell）
+## 在 Claude app 的「Code」分頁使用（毋須 Cloud Shell）
 
-如不便使用 Cloud Shell，可直接請 Claude 在對話中代為執行。此方式以 Gemini API key 連接 Gemini（Google AI 訂閱本身不能經 API 使用）；Claude 一方則使用你的 Claude 訂閱。
-
-一次性設定：
+如不便使用 Cloud Shell，可在 Claude app 的「Code」分頁開啟本 repository 的 session，由 Claude 代為執行。此方式以 Gemini API key 連接 Gemini（Google AI 訂閱本身不能經 API 使用）；Claude 一方則使用你的 Claude 訂閱。
 
 | 步驟 | 做法 |
 |---|---|
-| 容許連接 Gemini API | 在 claude.ai 的「Settings」→「Capabilities」中，把 `generativelanguage.googleapis.com` 加入允許的網域 |
-| 取得 API key | 在 aistudio.google.com 建立 API key；毋須啟用付費，即使外洩亦不會產生費用 |
+| 取得 API key | 在 aistudio.google.com 建立免費 API key，毋須啟用付費，即使外洩亦不會產生費用。Google 只容許在其支援地區使用 |
+| 開啟 session | 在 Claude app 的「Code」分頁開新 session，選擇 `2-bot` repository |
+| 開始討論 | 輸入「brainstorm：（題目）」，並貼上 API key |
 
-使用時，在新對話中告訴 Claude：「用 2-bot 幫我 brainstorm：（題目）」，並提供 API key。Claude 的工作環境會定期清空，因此每次新對話均須重新提供 API key。
-
-程式會自動選用最新而免費額度可用的 Gemini 型號，並記下成功的型號供下次使用；亦可以 `--gemini-model` 指定型號。
+- 「Code」分頁的雲端環境預設已容許連接 Google 的 API（`*.googleapis.com`），毋須更改任何設定。
+- Claude 會按 `CLAUDE.md` 的指引執行，API key 只保存在該 session 的臨時環境，不會上載至 GitHub。
+- 程式會自動選用最新而免費額度可用的 Gemini 型號，並記下成功的型號；亦可以 `--gemini-model` 指定型號。
 
 ## 討論紀錄
 
